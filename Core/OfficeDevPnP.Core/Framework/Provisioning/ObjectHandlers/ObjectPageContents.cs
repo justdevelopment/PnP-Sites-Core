@@ -97,7 +97,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                                             );
                                         web.Context.ExecuteQueryRetry();
 
-                                        var webPartxml = TokenizeWebPartXml(web, web.GetWebPartXml(webPart.Id, welcomePageUrl));
+                                        var webPartxml = TokenizeWebPartXml(web, web.GetWebPartXml(webPart.Id, welcomePageUrl), true);
 
                                         page.WebParts.Add(new Model.WebPart()
                                         {
@@ -225,7 +225,7 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             // Add WebParts to file
             foreach (var webPart in webParts)
             {
-                var webPartxml = TokenizeWebPartXml(web, web.GetWebPartXml(webPart.Id, welcomePageUrl));
+                var webPartxml = TokenizeWebPartXml(web, web.GetWebPartXml(webPart.Id, welcomePageUrl), false);
 
                 Model.WebPart newWp = new Model.WebPart()
                 {
@@ -253,7 +253,8 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
             return template;
         }
 
-        private string TokenizeWebPartXml(Web web, string xml)
+
+        private string TokenizeWebPartXml(Web web, string xml, bool isExtraction)
         {
             var lists = web.Lists;
             web.Context.Load(web, w => w.ServerRelativeUrl, w => w.Id);
@@ -265,10 +266,15 @@ namespace OfficeDevPnP.Core.Framework.Provisioning.ObjectHandlers
                 xml = Regex.Replace(xml, list.Id.ToString(), $"{{listid:{System.Security.SecurityElement.Escape(list.Title)}}}", RegexOptions.IgnoreCase);
             }
 
-            //some webparts already contains the site URL using ~sitecollection token (i.e: CQWP)
-            xml = Regex.Replace(xml, "\"~sitecollection/(.)*\"", "\"{site}\"", RegexOptions.IgnoreCase);
-            xml = Regex.Replace(xml, "'~sitecollection/(.)*'", "'{site}'", RegexOptions.IgnoreCase);
-            xml = Regex.Replace(xml, ">~sitecollection/(.)*<", ">{site}<", RegexOptions.IgnoreCase);
+            // Some webparts already contains the site URL using ~sitecollection token (i.e: CQWP)
+            // Only do this when you are creating an export file.  SharePoint will handle the token correctly on import and if you do this then you will break all JSLink & DisplayTemplate properties.
+            if (isExtraction) 
+            {
+                // ToDo: check this replace during export; it will still blindly replace all properties in the webpart with the relative web url; even JSLink will be fully replaced
+                xml = Regex.Replace(xml, "\"~sitecollection/(.)*\"", "\"{site}\"", RegexOptions.IgnoreCase);
+                xml = Regex.Replace(xml, "'~sitecollection/(.)*'", "'{site}'", RegexOptions.IgnoreCase);
+                xml = Regex.Replace(xml, ">~sitecollection/(.)*<", ">{site}<", RegexOptions.IgnoreCase);
+            }
 
             xml = Regex.Replace(xml, web.Id.ToString(), "{siteid}", RegexOptions.IgnoreCase);
             xml = Regex.Replace(xml, "(\"" + web.ServerRelativeUrl + ")(?!&)", "\"{site}", RegexOptions.IgnoreCase);
