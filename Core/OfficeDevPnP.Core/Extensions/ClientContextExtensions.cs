@@ -8,11 +8,31 @@ using System.Web;
 using OfficeDevPnP.Core;
 using OfficeDevPnP.Core.Diagnostics;
 using OfficeDevPnP.Core.Utilities;
+using System.Configuration;
+using System.Threading.Tasks;
+using System.Net.Http;
+using Newtonsoft.Json;
+using OfficeDevPnP.Core.Sites;
 
 namespace Microsoft.SharePoint.Client
 {
+    /// <summary>
+    /// Class that deals with cloning client context object, getting access token and validates server version
+    /// </summary>
     public static partial class ClientContextExtensions
     {
+        private static string userAgentFromConfig = null;
+        private static string accessToken = null;
+
+        /// <summary>
+        /// Static constructor, only executed once per class load
+        /// </summary>
+        static ClientContextExtensions()
+        {
+            ClientContextExtensions.userAgentFromConfig = ConfigurationManager.AppSettings["SharePointPnPUserAgent"];
+        }
+
+
 #if ONPREMISES
         private const string MicrosoftSharePointTeamServicesHeader = "MicrosoftSharePointTeamServices";
 #endif
@@ -35,17 +55,18 @@ namespace Microsoft.SharePoint.Client
 
 
         /// <summary>
-        /// 
+        /// Executes the current set of data retrieval queries and method invocations and retries it if needed.
         /// </summary>
-        /// <param name="clientContext"></param>
+        /// <param name="clientContext">clientContext to operate on</param>
         /// <param name="retryCount">Number of times to retry the request</param>
         /// <param name="delay">Milliseconds to wait before retrying the request. The delay will be increased (doubled) every retry</param>
-        public static void ExecuteQueryRetry(this ClientRuntimeContext clientContext, int retryCount = 10, int delay = 500)
+        /// <param name="userAgent">UserAgent string value to insert for this request. You can define this value in your app's config file using key="SharePointPnPUserAgent" value="PnPRocks"></param>
+        public static void ExecuteQueryRetry(this ClientRuntimeContext clientContext, int retryCount = 10, int delay = 500, string userAgent = null)
         {
-            ExecuteQueryImplementation(clientContext, retryCount, delay);
+            ExecuteQueryImplementation(clientContext, retryCount, delay, userAgent);
         }
 
-        private static void ExecuteQueryImplementation(ClientRuntimeContext clientContext, int retryCount = 10, int delay = 500)
+        private static void ExecuteQueryImplementation(ClientRuntimeContext clientContext, int retryCount = 10, int delay = 500, string userAgent = null)
         {
             var clientTag = string.Empty;
             if (clientContext is PnPClientContext)
@@ -85,9 +106,26 @@ namespace Microsoft.SharePoint.Client
                     clientContext.DisableReturnValueCache = true;
 #elif SP2016
                     clientContext.DisableReturnValueCache = true;
-#endif                
+#endif
+                    // Add event handler to "insert" app decoration header to mark the PnP Sites Core library as a known application
+                    EventHandler<WebRequestEventArgs> appDecorationHandler = (s, e) =>
+                    {
+                        if (string.IsNullOrEmpty(userAgent) && !string.IsNullOrEmpty(ClientContextExtensions.userAgentFromConfig))
+                        {
+                            userAgent = userAgentFromConfig;
+                        }
+
+                        e.WebRequestExecutor.WebRequest.UserAgent = string.IsNullOrEmpty(userAgent) ? $"{PnPCoreUtilities.PnPCoreUserAgent}" : userAgent;
+                    };
+
+                    clientContext.ExecutingWebRequest += appDecorationHandler;
+
                     // DO NOT CHANGE THIS TO EXECUTEQUERYRETRY
                     clientContext.ExecuteQuery();
+
+                    // Remove the app decoration event handler after the executequery
+                    clientContext.ExecutingWebRequest -= appDecorationHandler;
+
                     return;
                 }
                 catch (WebException wex)
@@ -204,8 +242,7 @@ namespace Microsoft.SharePoint.Client
         public static string GetAccessToken(this ClientRuntimeContext clientContext)
         {
             string accessToken = null;
-            // Issue a dummy request to get it from the Authorization header
-            clientContext.ExecutingWebRequest += (s, e) =>
+            EventHandler<WebRequestEventArgs> handler = (s, e) =>
             {
                 string authorization = e.WebRequestExecutor.RequestHeaders["Authorization"];
                 if (!string.IsNullOrEmpty(authorization))
@@ -213,7 +250,11 @@ namespace Microsoft.SharePoint.Client
                     accessToken = authorization.Replace("Bearer ", string.Empty);
                 }
             };
+            // Issue a dummy request to get it from the Authorization header
+            clientContext.ExecutingWebRequest += handler;
             clientContext.ExecuteQueryRetry();
+            clientContext.ExecutingWebRequest -= handler;
+
             return accessToken;
         }
 
@@ -237,14 +278,20 @@ namespace Microsoft.SharePoint.Client
         /// <summary>
         /// Checks the server library version of the context for a minimally required version
         /// </summary>
-        /// <param name="clientContext"></param>
-        /// <param name="minimallyRequiredVersion"></param>
-        /// <returns></returns>
+        /// <param name="clientContext">clientContext to operate on</param>
+        /// <param name="minimallyRequiredVersion">provide version to validate</param>
+        /// <returns>True if it has minimal required version, false otherwise</returns>
         public static bool HasMinimalServerLibraryVersion(this ClientRuntimeContext clientContext, string minimallyRequiredVersion)
         {
             return HasMinimalServerLibraryVersion(clientContext, new Version(minimallyRequiredVersion));
         }
 
+        /// <summary>
+        /// Checks the server library version of the context for a minimally required version
+        /// </summary>
+        /// <param name="clientContext">clientContext to operate on</param>
+        /// <param name="minimallyRequiredVersion">provide version to validate</param>
+        /// <returns>True if it has minimal required version, false otherwise</returns>
         public static bool HasMinimalServerLibraryVersion(this ClientRuntimeContext clientContext, Version minimallyRequiredVersion)
         {
             bool hasMinimalVersion = false;
@@ -279,7 +326,7 @@ namespace Microsoft.SharePoint.Client
                         string version = reader.ReadToEnd().Split('|')[2].Trim();
 
                         // Only compare the first three digits
-                        var compareToVersion = new Version(minimallyRequiredVersion.Major, minimallyRequiredVersion.MajorRevision, minimallyRequiredVersion.Minor, 0);
+                        var compareToVersion = new Version(minimallyRequiredVersion.Major, minimallyRequiredVersion.Minor, minimallyRequiredVersion.Build, 0);
                         hasMinimalVersion = new Version(version.Split('.')[0].ToInt32(), 0, version.Split('.')[3].ToInt32(), 0).CompareTo(compareToVersion) >= 0;
                     }
                 }
@@ -323,5 +370,79 @@ namespace Microsoft.SharePoint.Client
             return pnpMethod;
         }
 
+        /// <summary>
+        /// Returns the request digest from the current session/site
+        /// </summary>
+        /// <param name="context"></param>
+        /// <returns></returns>
+        public static async Task<string> GetRequestDigest(this ClientContext context)
+        {
+            //InitializeSecurity(context);
+
+            using (var handler = new HttpClientHandler())
+            {
+                string responseString = string.Empty;
+                var accessToken = context.GetAccessToken();
+
+                if (String.IsNullOrEmpty(accessToken))
+                {
+                    context.Web.EnsureProperty(w => w.Url);
+                    handler.Credentials = context.Credentials;
+                    handler.CookieContainer.SetCookies(new Uri(context.Web.Url), (context.Credentials as SharePointOnlineCredentials).GetAuthenticationCookie(new Uri(context.Web.Url)));
+                }
+
+                using (var httpClient = new PnPHttpProvider(handler))
+                {
+                    string requestUrl = String.Format("{0}/_api/contextinfo", context.Web.Url);
+                    HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
+                    request.Headers.Add("accept", "application/json;odata=verbose");
+
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        responseString = await response.Content.ReadAsStringAsync();
+                    }
+                    else
+                    {
+                        throw new Exception(await response.Content.ReadAsStringAsync());
+                    }
+                }
+                var contextInformation = JsonConvert.DeserializeObject<dynamic>(responseString);
+
+                string formDigestValue = contextInformation.d.GetContextWebInformation.FormDigestValue;
+                return await Task.Run(() => formDigestValue);
+            }
+        }
+
+        private static void Context_ExecutingWebRequest(object sender, WebRequestEventArgs e)
+        {
+            if (!String.IsNullOrEmpty(e.WebRequestExecutor.RequestHeaders.Get("Authorization")))
+            {
+                accessToken = e.WebRequestExecutor.RequestHeaders.Get("Authorization").Replace("Bearer ", "");
+            }
+        }
+
+        /// <summary>
+        /// BETA: Creates a Communication Site Collection
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <param name="siteCollectionCreationInformation"></param>
+        /// <returns></returns>
+        public static async Task<ClientContext> CreateSiteAsync(this ClientContext clientContext, CommunicationSiteCollectionCreationInformation siteCollectionCreationInformation)
+        {
+            return await SiteCollection.CreateAsync(clientContext, siteCollectionCreationInformation);
+        }
+
+        /// <summary>
+        /// BETA: Creates a Team Site Collection
+        /// </summary>
+        /// <param name="clientContext"></param>
+        /// <param name="siteCollectionCreationInformation"></param>
+        /// <returns></returns>
+        public static async Task<ClientContext> CreateSiteAsync(this ClientContext clientContext, TeamSiteCollectionCreationInformation siteCollectionCreationInformation)
+        {
+            return await SiteCollection.CreateAsync(clientContext, siteCollectionCreationInformation);
+        }
     }
 }
